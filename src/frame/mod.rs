@@ -11,7 +11,7 @@ impl Codec {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub(crate) enum Status {
+pub enum Status {
     Success,
     KeyNotFound,
     KeyExists,
@@ -271,13 +271,6 @@ impl Frame {
             key: Bytes::from(key),
             value: Bytes::from(serde_json::to_string(&value).unwrap()),
         }
-    }
-
-    pub fn is_success(&self) -> bool {
-        self.status
-            .as_ref()
-            .map(|status| *status == Status::Success)
-            .unwrap_or(false)
     }
 }
 

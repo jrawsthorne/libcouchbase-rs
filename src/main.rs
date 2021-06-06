@@ -5,9 +5,10 @@ use std::{
     convert::TryInto,
     net::SocketAddr,
     sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    time::Duration,
     usize,
 };
-use tokio::{net::TcpStream, sync::oneshot};
+use tokio::{net::TcpStream, sync::oneshot, time::sleep};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -25,6 +26,7 @@ pub struct Connection {
 pub(crate) struct ConnectionState {
     response_map: HashMap<Opaque, oneshot::Sender<Frame>>,
     cluster_config: Option<ClusterConfig>,
+    connected: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -73,8 +75,11 @@ pub struct Node {
 }
 
 pub struct Cluster {
-    connections: HashMap<SocketAddr, Arc<Connection>>,
+    connections: RwLock<HashMap<SocketAddr, Arc<Connection>>>,
     cluster_config: RwLock<ClusterConfig>,
+    username: String,
+    password: String,
+    bucket: Mutex<Option<String>>,
 }
 
 impl Cluster {
@@ -95,26 +100,34 @@ impl Cluster {
         }
 
         let cluster_config = RwLock::new(cluster_config);
+        let connections = RwLock::new(connections);
 
         Self {
             connections,
             cluster_config,
+            username,
+            password,
+            bucket: Default::default(),
         }
     }
 
     pub async fn open_bucket(&self, bucket: impl Into<String>) {
         let bucket = bucket.into();
-        for connection in self.connections.values() {
+        for connection in self.connections.read().unwrap().values() {
             connection.open_bucket(&bucket).await;
         }
 
+        let connections = self.connections.read().unwrap();
+
         // get new cluster config from random node
-        let random_node = self.connections.values().next().unwrap();
+        let random_node = connections.values().next().unwrap();
         let state = random_node.state.lock().unwrap();
         let new_config = state.cluster_config.as_ref().unwrap().clone();
 
         let old_config = &mut *self.cluster_config.write().unwrap();
         *old_config = new_config;
+
+        *self.bucket.lock().unwrap() = Some(bucket);
     }
 
     fn cluster_config(&self) -> RwLockReadGuard<ClusterConfig> {
@@ -125,7 +138,7 @@ impl Cluster {
         &self,
         cluster_config: &ClusterConfig,
         vbucket_id: u16,
-    ) -> &Arc<Connection> {
+    ) -> Arc<Connection> {
         let server_map = cluster_config.v_bucket_server_map.as_ref().unwrap();
 
         // Just get active for now
@@ -136,24 +149,95 @@ impl Cluster {
 
         // TODO: just use str
         let addr = node.parse().unwrap();
-        let connection = &self.connections[&addr];
+        let connection = self.connections.read().unwrap()[&addr].clone();
         connection
     }
 
-    pub async fn get<V: serde::de::DeserializeOwned>(&self, key: impl Into<String>) -> Option<V> {
+    pub async fn get<V: serde::de::DeserializeOwned>(
+        &self,
+        key: impl Into<String>,
+    ) -> Result<Option<V>, Status> {
         let key = key.into();
 
-        let (connection, vbucket_id) = self.connection_and_vbucket_id(&key);
-
-        println!("get {} from node {:?}", key, connection.addr);
-
-        connection.get(vbucket_id, key).await
+        loop {
+            let (connection, vbucket_id) = self.connection_and_vbucket_id(&key);
+            println!("get {} from node {:?}", key, connection.addr);
+            match connection.get(vbucket_id, key.clone()).await {
+                Ok(val) => return Ok(val),
+                Err(Status::NotMyVBucket) => {
+                    self.handle_not_my_vbucket().await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
-    fn connection_and_vbucket_id(&self, key: &str) -> (&Arc<Connection>, u16) {
+    async fn handle_not_my_vbucket(&self) {
+        let mut updated_cluster_config = false;
+
+        let connections: Vec<Arc<Connection>> =
+            self.connections.read().unwrap().values().cloned().collect();
+
+        for connection in connections {
+            if !connection.state.lock().unwrap().connected {
+                continue;
+            }
+
+            // TODO: Handle timeout/error
+            connection.handle_config_change().await;
+
+            if updated_cluster_config {
+                continue;
+            }
+
+            let new_config = connection
+                .state
+                .lock()
+                .unwrap()
+                .cluster_config
+                .clone()
+                .unwrap();
+
+            *self.cluster_config.write().unwrap() = new_config;
+
+            let mut connections = self.connections.write().unwrap();
+
+            // any new connections needed
+            for node in &self.cluster_config.read().unwrap().nodes_ext {
+                let kv_port = node.services["kv"];
+                let addr = format!("{}:{}", node.hostname.as_ref().unwrap(), kv_port)
+                    .parse()
+                    .unwrap();
+
+                if connections.contains_key(&addr) {
+                    continue;
+                }
+
+                let connection =
+                    Connection::new(addr, self.username.clone(), self.password.clone()).await;
+
+                if let Some(bucket) = &*self.bucket.lock().unwrap() {
+                    connection.open_bucket(bucket).await;
+                }
+
+                connections.insert(addr, connection);
+            }
+
+            updated_cluster_config = true;
+        }
+
+        if !updated_cluster_config {
+            todo!("no connected nodes");
+        }
+    }
+
+    fn connection_and_vbucket_id(&self, key: &str) -> (Arc<Connection>, u16) {
         let cluster_config = self.cluster_config();
         let vbucket_id = self.vbucket_id(&cluster_config, &key);
         let connection = self.connection_for_key(&cluster_config, vbucket_id);
+
+        assert!(connection.state.lock().unwrap().connected);
+
         (connection, vbucket_id)
     }
 
@@ -161,16 +245,25 @@ impl Cluster {
         &self,
         key: impl Into<String>,
         value: impl serde::ser::Serialize + std::fmt::Debug,
-    ) {
+    ) -> Result<(), Status> {
         let key = key.into();
-        let (connection, vbucket_id) = self.connection_and_vbucket_id(&key);
 
-        println!(
-            "insert {}->{:?} into node {:?}",
-            key, value, connection.addr
-        );
+        loop {
+            let (connection, vbucket_id) = self.connection_and_vbucket_id(&key);
 
-        connection.set(vbucket_id, key, value).await
+            println!(
+                "insert {}->{:?} into node {:?}",
+                key, value, connection.addr
+            );
+            // TODO: Remove clone in happy case
+            match connection.set(vbucket_id, key.clone(), &value).await {
+                Ok(()) => return Ok(()),
+                Err(Status::NotMyVBucket) => {
+                    self.handle_not_my_vbucket().await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn vbucket_id(&self, cluster_config: &ClusterConfig, key: &str) -> u16 {
@@ -254,6 +347,10 @@ impl Connection {
     async fn open_bucket(&self, bucket: impl Into<String>) {
         let bucket = bucket.into();
         self.select_bucket(bucket).await;
+        self.handle_config_change().await;
+    }
+
+    async fn handle_config_change(&self) {
         let cluster_config = self.get_cluster_config().await;
         self.state.lock().unwrap().cluster_config = Some(cluster_config);
     }
@@ -264,28 +361,38 @@ impl Connection {
             .unwrap();
     }
 
-    async fn get<V: serde::de::DeserializeOwned>(&self, vbucket_id: u16, key: String) -> Option<V> {
+    async fn get<V: serde::de::DeserializeOwned>(
+        &self,
+        vbucket_id: u16,
+        key: String,
+    ) -> Result<Option<V>, Status> {
         let resp = self
             .request(Frame::get_request(key, vbucket_id))
             .await
             .unwrap();
 
-        assert!(resp.is_success());
-
-        if resp.status.unwrap() == Status::KeyNotFound {
-            None
-        } else {
-            Some(serde_json::from_slice(&resp.value).unwrap())
+        match resp.status.unwrap() {
+            Status::Success => Ok(Some(serde_json::from_slice(&resp.value).unwrap())),
+            Status::KeyNotFound => Ok(None),
+            err => Err(err),
         }
     }
 
-    async fn set(&self, vbucket_id: u16, key: String, value: impl serde::ser::Serialize) {
+    async fn set(
+        &self,
+        vbucket_id: u16,
+        key: String,
+        value: impl serde::ser::Serialize,
+    ) -> Result<(), Status> {
         let resp = self
             .request(Frame::set_request(key, value, vbucket_id))
             .await
             .unwrap();
 
-        assert!(resp.is_success());
+        match resp.status.unwrap() {
+            Status::Success => Ok(()),
+            err => Err(err),
+        }
     }
 }
 
@@ -294,6 +401,9 @@ async fn read_write_task(
     mut out_rx: tokio::sync::mpsc::UnboundedReceiver<Frame>,
 ) {
     let mut stream = TcpStream::connect(connection.addr).await.unwrap();
+
+    connection.state.lock().unwrap().connected = true;
+
     stream.set_nodelay(true).unwrap();
     let (r, w) = stream.split();
     let codec = Codec::new();
@@ -321,10 +431,22 @@ async fn read_write_task(
         }
     };
 
+    let disconnected_task = async {
+        loop {
+            sleep(Duration::from_secs(10)).await;
+            if !connection.state.lock().unwrap().connected {
+                break;
+            }
+        }
+    };
+
     tokio::select! {
         _ = read_task => {}
         _ = write_task => {}
+        _ = disconnected_task => {}
     }
+
+    connection.state.lock().unwrap().connected = false;
 }
 
 #[tokio::main]
@@ -338,25 +460,29 @@ async fn main() {
 
     cluster.open_bucket("travel-sample").await;
 
-    let id = random();
-    let new_airline = Airline {
-        id,
-        r#type: "airline".to_string(),
-        name: "Test".to_string(),
-        iata: "Test".to_string(),
-        icao: "Test".to_string(),
-        callsign: "Test".to_string(),
-        country: "Test".to_string(),
-    };
-    let key = format!("airline_{}", id);
+    loop {
+        let id = random();
+        let new_airline = Airline {
+            id,
+            r#type: "airline".to_string(),
+            name: "Test".to_string(),
+            iata: "Test".to_string(),
+            icao: "Test".to_string(),
+            callsign: "Test".to_string(),
+            country: "Test".to_string(),
+        };
+        let key = format!("airline_{}", id);
 
-    cluster.set(key.clone(), new_airline.clone()).await;
+        cluster.set(key.clone(), new_airline.clone()).await.unwrap();
 
-    println!("inserted {:?} with key {}", new_airline, key);
+        println!("inserted {:?} with key {}", new_airline, key);
 
-    let airline: Airline = cluster.get(&key).await.unwrap();
+        let airline: Airline = cluster.get(&key).await.unwrap().unwrap();
 
-    assert_eq!(new_airline, airline);
+        assert_eq!(new_airline, airline);
+
+        sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn v_bucket_hash(key: &str, num_vbuckets: u32) -> u32 {
