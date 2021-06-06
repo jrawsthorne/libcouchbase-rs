@@ -153,9 +153,9 @@ impl Cluster {
         connection
     }
 
-    pub async fn get<V: serde::de::DeserializeOwned>(
+    pub async fn get<V: serde::de::DeserializeOwned, K: Into<String>>(
         &self,
-        key: impl Into<String>,
+        key: K,
     ) -> Result<Option<V>, Status> {
         let key = key.into();
 
@@ -257,6 +257,24 @@ impl Cluster {
             );
             // TODO: Remove clone in happy case
             match connection.set(vbucket_id, key.clone(), &value).await {
+                Ok(()) => return Ok(()),
+                Err(Status::NotMyVBucket) => {
+                    self.handle_not_my_vbucket().await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    pub async fn delete(&self, key: impl Into<String>) -> Result<(), Status> {
+        let key = key.into();
+
+        loop {
+            let (connection, vbucket_id) = self.connection_and_vbucket_id(&key);
+
+            println!("delete {} from node {:?}", key, connection.addr);
+            // TODO: Remove clone in happy case
+            match connection.delete(vbucket_id, key.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(Status::NotMyVBucket) => {
                     self.handle_not_my_vbucket().await;
@@ -394,6 +412,18 @@ impl Connection {
             err => Err(err),
         }
     }
+
+    async fn delete(&self, vbucket_id: u16, key: String) -> Result<(), Status> {
+        let resp = self
+            .request(Frame::delete_request(key, vbucket_id))
+            .await
+            .unwrap();
+
+        match resp.status.unwrap() {
+            Status::Success => Ok(()),
+            err => Err(err),
+        }
+    }
 }
 
 async fn read_write_task(
@@ -480,6 +510,10 @@ async fn main() {
         let airline: Airline = cluster.get(&key).await.unwrap().unwrap();
 
         assert_eq!(new_airline, airline);
+
+        cluster.delete(&key).await.unwrap();
+
+        assert!(cluster.get::<Airline, _>(&key).await.unwrap().is_none());
 
         sleep(Duration::from_secs(1)).await;
     }
