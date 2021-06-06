@@ -1,5 +1,4 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use serde::Serialize;
 use std::{convert::TryFrom, io, usize};
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
@@ -43,7 +42,21 @@ impl From<Status> for u16 {
             Status::InvalidArguments => 0x0004,
             Status::AuthenticationError => 0x0020,
             Status::NotMyVBucket => 0x0007,
-            _ => 0x0000,
+            Status::KeyExists => todo!(),
+            Status::ValueTooLarge => todo!(),
+            Status::ItemNotStored => todo!(),
+            Status::BucketNotConnected => todo!(),
+            Status::StaleAuthenticationContext => todo!(),
+            Status::AuthenticationContinue => todo!(),
+            Status::RollbackRequired => todo!(),
+            Status::NoAccess => todo!(),
+            Status::NodeInitializing => todo!(),
+            Status::UnknownCommand => todo!(),
+            Status::OutOfMemory => todo!(),
+            Status::NotSupported => todo!(),
+            Status::InternalError => todo!(),
+            Status::Busy => todo!(),
+            Status::TemporaryFailure => todo!(),
         }
     }
 }
@@ -56,6 +69,7 @@ impl TryFrom<u16> for Status {
             0x0000 => Status::Success,
             0x0001 => Status::KeyNotFound,
             0x0004 => Status::InvalidArguments,
+            0x0007 => Status::NotMyVBucket,
             0x0020 => Status::AuthenticationError,
             _ => return Err(anyhow::anyhow!("invalid status").into()),
         })
@@ -240,7 +254,7 @@ impl Frame {
         }
     }
 
-    pub(crate) fn set_request(key: String, value: impl Serialize, vbucket_id: u16) -> Frame {
+    pub(crate) fn set_request(key: String, value: impl serde::Serialize, vbucket_id: u16) -> Frame {
         // empty flags and expiration
         let mut extras = BytesMut::with_capacity(8);
         extras.put_u32(0);
