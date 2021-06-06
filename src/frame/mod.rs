@@ -136,6 +136,76 @@ pub enum DecodeError {
     Other(#[from] anyhow::Error),
 }
 
+pub(crate) struct FrameBuilder {
+    pub(crate) magic: Magic,
+    pub(crate) opcode: Option<Opcode>,
+    pub(crate) data_type: DataType,
+    pub(crate) vbucket_id: Option<u16>,
+    pub(crate) status: Option<Status>,
+    pub(crate) opaque: u32,
+    pub(crate) cas: u64,
+    pub(crate) extras: Bytes,
+    pub(crate) key: Bytes,
+    pub(crate) value: Bytes,
+}
+
+impl FrameBuilder {
+    pub fn request() -> FrameBuilder {
+        FrameBuilder {
+            magic: Magic::RequestFromClient,
+            opcode: None,
+            data_type: DataType::Raw,
+            vbucket_id: Some(0), // vbucket_id must be set for request
+            status: None,
+            opaque: 0,
+            cas: 0,
+            extras: Bytes::new(),
+            key: Bytes::new(),
+            value: Bytes::new(),
+        }
+    }
+
+    pub fn opcode(mut self, opcode: Opcode) -> FrameBuilder {
+        self.opcode = Some(opcode);
+        self
+    }
+
+    pub fn extras(mut self, extras: Bytes) -> FrameBuilder {
+        self.extras = extras;
+        self
+    }
+
+    pub fn key(mut self, key: impl Into<Bytes>) -> FrameBuilder {
+        self.key = key.into();
+        self
+    }
+
+    pub fn value(mut self, value: Bytes) -> FrameBuilder {
+        self.value = value;
+        self
+    }
+
+    pub fn vbucket_id(mut self, vbucket_id: u16) -> FrameBuilder {
+        self.vbucket_id = Some(vbucket_id);
+        self
+    }
+
+    pub fn build(self) -> Frame {
+        Frame {
+            magic: self.magic,
+            opcode: self.opcode.unwrap(),
+            data_type: self.data_type,
+            vbucket_id: self.vbucket_id,
+            status: self.status,
+            opaque: self.opaque,
+            cas: self.cas,
+            extras: self.extras,
+            key: self.key,
+            value: self.value,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub(crate) magic: Magic,
@@ -152,125 +222,81 @@ pub struct Frame {
 
 impl Frame {
     pub(crate) fn hello_request(user_agent: String, features: Vec<Feature>) -> Frame {
-        Frame {
-            magic: Magic::RequestFromClient,
-            opcode: Opcode::Hello,
-            data_type: DataType::Raw,
-            vbucket_id: Some(0),
-            status: None,
-            opaque: 0,
-            cas: 0,
-            extras: Bytes::new(),
-            key: Bytes::from(user_agent),
-            value: {
+        FrameBuilder::request()
+            .opcode(Opcode::Hello)
+            .key(user_agent)
+            .value({
                 let mut bytes = BytesMut::with_capacity(features.len() * 2);
                 for feature in features {
                     bytes.put_u16(feature.as_u16());
                 }
                 bytes.freeze()
-            },
-        }
+            })
+            .build()
     }
 
     pub(crate) fn sasl_list_mech_request() -> Frame {
-        Frame {
-            magic: Magic::RequestFromClient,
-            opcode: Opcode::SaslListMech,
-            data_type: DataType::Raw,
-            vbucket_id: Some(0),
-            status: None,
-            opaque: 0,
-            cas: 0,
-            extras: Bytes::new(),
-            key: Bytes::new(),
-            value: Bytes::new(),
-        }
+        FrameBuilder::request().opcode(Opcode::SaslListMech).build()
     }
 
     pub(crate) fn sasl_auth_request(username: String, password: String) -> Frame {
-        Frame {
-            magic: Magic::RequestFromClient,
-            opcode: Opcode::SaslAuth,
-            data_type: DataType::Raw,
-            vbucket_id: Some(0),
-            status: None,
-            opaque: 0,
-            cas: 0,
-            extras: Bytes::new(),
-            key: Bytes::from("PLAIN"),
-            value: {
+        FrameBuilder::request()
+            .opcode(Opcode::SaslAuth)
+            .key("PLAIN")
+            .value({
                 let mut bytes = BytesMut::with_capacity(2 + username.len() + password.len());
                 bytes.put_u8(0);
                 bytes.put(username.as_bytes());
                 bytes.put_u8(0);
                 bytes.put(password.as_bytes());
                 bytes.freeze()
-            },
-        }
+            })
+            .build()
     }
 
     pub(crate) fn get_cluster_config_request() -> Frame {
-        Frame {
-            magic: Magic::RequestFromClient,
-            opcode: Opcode::GetClusterConfig,
-            data_type: DataType::Raw,
-            vbucket_id: Some(0),
-            status: None,
-            opaque: 0,
-            cas: 0,
-            extras: Bytes::new(),
-            key: Bytes::new(),
-            value: Bytes::new(),
-        }
+        FrameBuilder::request()
+            .opcode(Opcode::GetClusterConfig)
+            .build()
     }
 
     pub(crate) fn select_bucket_request(bucket: String) -> Frame {
-        Frame {
-            magic: Magic::RequestFromClient,
-            opcode: Opcode::SelectBucket,
-            data_type: DataType::Raw,
-            vbucket_id: Some(0),
-            status: None,
-            opaque: 0,
-            cas: 0,
-            extras: Bytes::new(),
-            key: Bytes::from(bucket),
-            value: Bytes::new(),
-        }
+        FrameBuilder::request()
+            .opcode(Opcode::SelectBucket)
+            .key(bucket)
+            .build()
     }
 
     pub(crate) fn get_request(key: String, vbucket_id: u16) -> Frame {
-        Frame {
-            magic: Magic::RequestFromClient,
-            opcode: Opcode::Get,
-            data_type: DataType::Raw,
-            vbucket_id: Some(vbucket_id),
-            status: None,
-            opaque: 0,
-            cas: 0,
-            extras: Bytes::new(),
-            key: Bytes::from(key),
-            value: Bytes::new(),
-        }
+        FrameBuilder::request()
+            .opcode(Opcode::Get)
+            .vbucket_id(vbucket_id)
+            .key(key)
+            .build()
     }
 
     pub(crate) fn set_request(key: String, value: impl serde::Serialize, vbucket_id: u16) -> Frame {
-        // empty flags and expiration
-        let mut extras = BytesMut::with_capacity(8);
-        extras.put_u32(0);
-        extras.put_u32(0);
-        Frame {
-            magic: Magic::RequestFromClient,
-            opcode: Opcode::Set,
-            data_type: DataType::Raw,
-            vbucket_id: Some(vbucket_id),
-            status: None,
-            opaque: 0,
-            cas: 0,
-            extras: extras.freeze(),
-            key: Bytes::from(key),
-            value: Bytes::from(serde_json::to_string(&value).unwrap()),
-        }
+        FrameBuilder::request()
+            .opcode(Opcode::Set)
+            .vbucket_id(vbucket_id)
+            .extras({
+                // empty flags and expiration
+                let mut extras = BytesMut::with_capacity(8);
+                extras.put_u32(0);
+                extras.put_u32(0);
+                extras.freeze()
+            })
+            .key(key)
+            .value(Bytes::from(serde_json::to_string(&value).unwrap()))
+            .build()
+    }
+
+    pub(crate) fn delete_request(key: String, vbucket_id: u16) -> Frame {
+        FrameBuilder::request()
+            .opcode(Opcode::Delete)
+            .vbucket_id(vbucket_id)
+            .key(key)
+            .build()
     }
 }
 
@@ -335,6 +361,7 @@ pub(crate) enum Opcode {
     SelectBucket,
     SaslAuth,
     Set,
+    Delete,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -344,6 +371,7 @@ impl TryFrom<u8> for Opcode {
         Ok(match value {
             0x00 => Opcode::Get,
             0x01 => Opcode::Set,
+            0x04 => Opcode::Delete,
             0x1f => Opcode::Hello,
             0x20 => Opcode::SaslListMech,
             0x21 => Opcode::SaslAuth,
@@ -359,6 +387,7 @@ impl From<Opcode> for u8 {
         match opcode {
             Opcode::Get => 0x00,
             Opcode::Set => 0x01,
+            Opcode::Delete => 0x04,
             Opcode::Hello => 0x1f,
             Opcode::SaslListMech => 0x20,
             Opcode::SaslAuth => 0x21,
